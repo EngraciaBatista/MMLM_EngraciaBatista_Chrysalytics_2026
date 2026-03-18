@@ -33,6 +33,9 @@ MATCHUP_BASE_FEATURES = [
     "win_pct",
     "avg_margin",
     "pace",
+    "avg_dr",           # defensive rebounds per game (when available)
+    "avg_blk",          # blocks per game (when available)
+    "avg_pf",           # personal fouls per game (when available)
 ]
 
 # All diff columns exposed to the model (base diffs + computed interactions).

@@ -63,9 +63,9 @@ def build_power_training_frame(
 
     # Difference features A - B.
     for col in [
-        "off_rating",
-        "def_rating",
-        "tempo",
+        "off_eff",
+        "def_eff",
+        "pace",
         "win_pct",
         "avg_margin",
         "mean_rank",
@@ -147,9 +147,9 @@ def compute_team_power_ratings(
         feat["SeedNum"] = np.nan
 
     feature_cols = {
-        "off_rating": "off_rating",
-        "def_rating": "def_rating",
-        "tempo": "tempo",
+        "off_eff": "off_eff",
+        "def_eff": "def_eff",
+        "pace": "pace",
         "win_pct": "win_pct",
         "avg_margin": "avg_margin",
         "mean_rank": "mean_rank",

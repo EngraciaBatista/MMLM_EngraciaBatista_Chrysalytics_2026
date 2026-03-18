@@ -43,6 +43,37 @@ from ..models.tournament_models import (
 from ..validation.metrics import brier_score
 
 
+def _load_matchups_for_league(
+    league: str,
+    cfg: dict,
+    models_dir: Path,
+    data_dir: Path,
+) -> pd.DataFrame:
+    """Load team features + tournament results and build the matchup training frame."""
+    paths = DataPaths(base_dir=data_dir)
+    min_season = cfg["seasons"]["min_season"]
+    max_season = cfg["seasons"]["max_season"]
+
+    feat_path = models_dir / f"{league}_team_features.csv"
+    if not feat_path.exists():
+        raise FileNotFoundError(
+            f"Team features not found: {feat_path}\nRun build_features.py first."
+        )
+    team_features = pd.read_csv(feat_path)
+
+    tourney = load_tourney_results(paths, league)
+    tourney = tourney[
+        (tourney["Season"] >= min_season) & (tourney["Season"] <= max_season)
+    ].copy()
+
+    matchups = build_tournament_training_frame(
+        tourney_results=tourney,
+        team_features=team_features,
+        base_feature_names=MATCHUP_BASE_FEATURES,
+    )
+    return matchups
+
+
 # ── Optuna tuning ─────────────────────────────────────────────────────────────
 
 def _run_optuna_tuning(
@@ -71,6 +102,8 @@ def _run_optuna_tuning(
             "random_state": 2026,
             "verbose": -1,
         }
+        # Also tune margin_clip: range [15, 35] around the default of 25.
+        trial_margin_clip = trial.suggest_float("margin_clip", 15.0, 35.0)
         cfg = TournamentModelConfig(features=available_feats, lgbm_params=params)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -89,7 +122,7 @@ def _run_optuna_tuning(
                 return 0.25
 
             spline = fit_spline_calibrator(
-                np.array(oof_margins), np.array(oof_labels), margin_clip
+                np.array(oof_margins), np.array(oof_labels), trial_margin_clip
             )
 
             briers = []
@@ -106,7 +139,7 @@ def _run_optuna_tuning(
                 )
                 margins = lgbm.predict(test_df[available_feats].values.astype(float))
                 probs = np.clip(
-                    spline(np.clip(margins, -margin_clip, margin_clip)), 0.0, 1.0
+                    spline(np.clip(margins, -trial_margin_clip, trial_margin_clip)), 0.0, 1.0
                 )
                 briers.append(brier_score(test_df["label"].values.astype(int), probs))
 
@@ -115,66 +148,52 @@ def _run_optuna_tuning(
     study = optuna.create_study(direction="minimize")
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     best = study.best_params
+    # Extract margin_clip separately; remaining keys are LightGBM params.
+    best_margin_clip = float(best.pop("margin_clip", margin_clip))
     best["random_state"] = 2026
     best["verbose"] = -1
-    return best
+    return best, best_margin_clip
 
 
-# ── Main training function ────────────────────────────────────────────────────
+# ── Shared training core ──────────────────────────────────────────────────────
 
-def train_for_league(config_path: Path, league: str, tune: bool = False) -> None:
-    with open(config_path, "r") as f:
-        cfg = yaml.safe_load(f)
+def _prepare_matchups(
+    all_matchups: pd.DataFrame,
+    available_feats: list[str],
+    tag: str,
+) -> pd.DataFrame:
+    """Impute NaN features with season means; drop only rows with missing target."""
+    n_before = len(all_matchups)
+    for feat_col in available_feats:
+        if feat_col in all_matchups.columns and all_matchups[feat_col].isna().any():
+            season_means = all_matchups.groupby("Season")[feat_col].transform("mean")
+            global_mean = all_matchups[feat_col].mean()
+            all_matchups[feat_col] = (
+                all_matchups[feat_col].fillna(season_means).fillna(global_mean)
+            )
+    if "point_diff" in all_matchups.columns:
+        all_matchups = all_matchups.dropna(subset=["point_diff"]).reset_index(drop=True)
+    n_dropped = n_before - len(all_matchups)
+    if n_dropped > 0:
+        print(f"[{tag}] Dropped {n_dropped} rows with missing target ({n_dropped/n_before*100:.1f}%).")
+    else:
+        print(f"[{tag}] All {n_before} rows retained after NaN imputation.")
+    return all_matchups
 
-    data_dir = Path(cfg["paths"]["data_dir"])
-    models_dir = Path(cfg["paths"]["models_dir"])
-    models_dir.mkdir(parents=True, exist_ok=True)
 
-    min_season = cfg["seasons"]["min_season"]
-    max_season = cfg["seasons"]["max_season"]
+def _train_and_save(
+    tag: str,
+    all_matchups: pd.DataFrame,
+    available_feats: list[str],
+    cfg: dict,
+    models_dir: Path,
+    tune: bool,
+) -> None:
+    """Core training loop: Optuna tuning → OOF spline calibration → fold ensemble → save."""
     cv_test_seasons = cfg["seasons"]["cv_test_seasons"]
     calib_seasons: list[int] = cfg["seasons"].get("calib_seasons", [])
     margin_clip: float = cfg.get("tournament_model", {}).get("margin_clip", 25.0)
 
-    paths = DataPaths(base_dir=data_dir)
-
-    # ── Load team features ────────────────────────────────────────────────────
-    feat_path = models_dir / f"{league}_team_features.csv"
-    if not feat_path.exists():
-        raise FileNotFoundError(
-            f"Team features not found: {feat_path}\nRun build_features.py first."
-        )
-    team_features = pd.read_csv(feat_path)
-
-    # ── Load tournament results ───────────────────────────────────────────────
-    tourney = load_tourney_results(paths, league)  # type: ignore[arg-type]
-    tourney = tourney[
-        (tourney["Season"] >= min_season) & (tourney["Season"] <= max_season)
-    ].copy()
-
-    # ── Build mirrored matchup training frame ────────────────────────────────
-    all_matchups = build_tournament_training_frame(
-        tourney_results=tourney,
-        team_features=team_features,
-        base_feature_names=MATCHUP_BASE_FEATURES,
-    )
-
-    # Use features from config, intersected with what's available.
-    config_feats = cfg.get("tournament_model", {}).get("features", MATCHUP_DIFF_FEATURES)
-    available_feats = [f for f in config_feats if f in all_matchups.columns]
-    missing_feats = sorted(set(config_feats) - set(available_feats))
-    if missing_feats:
-        print(f"[{league}] Skipping unavailable features: {missing_feats}")
-
-    # ── Drop rows missing features or point_diff ──────────────────────────────
-    drop_cols = available_feats + (["point_diff"] if "point_diff" in all_matchups.columns else [])
-    n_before = len(all_matchups)
-    all_matchups = all_matchups.dropna(subset=drop_cols).reset_index(drop=True)
-    n_dropped = n_before - len(all_matchups)
-    if n_dropped > 0:
-        print(f"[{league}] Dropped {n_dropped} rows with NaN ({n_dropped/n_before*100:.1f}%).")
-
-    # ── Hyperparameter tuning ─────────────────────────────────────────────────
     cv_data = all_matchups[~all_matchups["Season"].isin(calib_seasons)]
 
     lgbm_params = cfg.get("tournament_model", {}).get("lgbm_params", {
@@ -186,16 +205,17 @@ def train_for_league(config_path: Path, league: str, tune: bool = False) -> None
 
     if tune:
         n_trials = cfg.get("tournament_model", {}).get("optuna_trials", 50)
-        print(f"\n[{league}] Running Optuna tuning ({n_trials} trials)...")
-        lgbm_params = _run_optuna_tuning(
+        print(f"\n[{tag}] Running Optuna tuning ({n_trials} trials)...")
+        lgbm_params, margin_clip = _run_optuna_tuning(
             cv_data=cv_data,
             available_feats=available_feats,
             cv_test_seasons=cv_test_seasons,
-            min_season=min_season,
+            min_season=cfg["seasons"]["min_season"],
             margin_clip=margin_clip,
             n_trials=n_trials,
         )
-        print(f"[{league}] Best params: {lgbm_params}")
+        print(f"[{tag}] Best LGBM params: {lgbm_params}")
+        print(f"[{tag}] Best margin_clip: {margin_clip:.2f}")
 
     tm_config = TournamentModelConfig(
         features=available_feats,
@@ -203,14 +223,12 @@ def train_for_league(config_path: Path, league: str, tune: bool = False) -> None
         margin_clip=margin_clip,
     )
 
-    # ── LOSO OOF collection → spline calibration ─────────────────────────────
-    # Train one model per CV fold (leave that season out), collect all OOF
-    # margin predictions, then fit a single global spline on (margin, win) pairs.
-    # This spline converts predicted margins to calibrated win probabilities.
-    print(f"\n[{league}] Collecting OOF margin predictions for spline calibration...")
+    # ── LOSO OOF collection → spline calibration + fold ensemble ─────────────
+    print(f"\n[{tag}] Collecting OOF margin predictions for spline calibration...")
     oof_margins: list[float] = []
     oof_labels: list[int] = []
     oof_season_list: list[int] = []
+    fold_models: list = []  # save each fold's trained model for the ensemble
 
     for test_season in sorted(cv_test_seasons):
         train_df = cv_data[cv_data["Season"] < test_season].reset_index(drop=True)
@@ -218,21 +236,22 @@ def train_for_league(config_path: Path, league: str, tune: bool = False) -> None
         if train_df.empty or test_df.empty:
             continue
         fold_lgbm = train_margin_model(train_df, tm_config)
+        fold_models.append(fold_lgbm)
         fold_margins = fold_lgbm.predict(test_df[available_feats].values.astype(float))
         oof_margins.extend(fold_margins.tolist())
         oof_labels.extend(test_df["label"].values.tolist())
         oof_season_list.extend(test_df["Season"].values.tolist())
 
     if not oof_margins:
-        raise RuntimeError(f"[{league}] No OOF predictions collected — check cv_test_seasons.")
+        raise RuntimeError(f"[{tag}] No OOF predictions collected — check cv_test_seasons.")
 
     spline = fit_spline_calibrator(
         np.array(oof_margins), np.array(oof_labels), margin_clip
     )
-    print(f"[{league}] Spline fitted on {len(oof_margins)} OOF predictions.")
+    print(f"[{tag}] Spline fitted on {len(oof_margins)} OOF predictions.")
 
-    # ── CV evaluation (using the global spline for all folds) ─────────────────
-    print(f"\n[{league}] CV evaluation on seasons: {cv_test_seasons}")
+    # ── CV evaluation ─────────────────────────────────────────────────────────
+    print(f"\n[{tag}] CV evaluation on seasons: {cv_test_seasons}")
     cv_briers = []
     for test_season in sorted(cv_test_seasons):
         season_mask = [s == test_season for s in oof_season_list]
@@ -242,34 +261,29 @@ def train_for_league(config_path: Path, league: str, tune: bool = False) -> None
         s_labels = np.array([l for l, flag in zip(oof_labels, season_mask) if flag])
         s_probs = np.clip(spline(np.clip(s_margins, -margin_clip, margin_clip)), 0.0, 1.0)
         s_brier = brier_score(s_labels.astype(int), s_probs)
-        n_games = len(s_labels) // 2  # mirrored, so each real game appears twice
+        n_games = len(s_labels) // 2
         cv_briers.append(s_brier)
         print(f"  Season {test_season}: Brier={s_brier:.5f}  (n={n_games})")
 
     if cv_briers:
         print(f"  Mean CV Brier: {np.mean(cv_briers):.5f}")
 
-    # ── Final model ────────────────────────────────────────────────────────────
-    # Train on all non-calib seasons with the tuned params.
+    # ── Final model (trained on all non-calib data) ────────────────────────────
     if calib_seasons:
         final_train = all_matchups[
             ~all_matchups["Season"].isin(calib_seasons)
         ].reset_index(drop=True)
         print(
-            f"\n[{league}] Final model: {len(final_train)} training rows "
+            f"\n[{tag}] Final model: {len(final_train)} training rows "
             f"(calib seasons {calib_seasons} held out for spline)."
         )
     else:
         final_train = all_matchups.copy()
 
-    print(f"[{league}] Training final margin regression model...")
+    print(f"[{tag}] Training final margin regression model...")
     final_lgbm = train_margin_model(final_train, tm_config)
 
-    # Re-fit spline including calib seasons' predictions for a fuller calibration.
-    # Use the global spline from OOF (doesn't include calib seasons), which is
-    # the unbiased estimate.  The spline is not re-fitted on calib seasons to
-    # avoid data leakage.
-    model = MarginRegressionTournamentModel(
+    final_model = MarginRegressionTournamentModel(
         lgbm=final_lgbm,
         spline=spline,
         features=available_feats,
@@ -277,14 +291,89 @@ def train_for_league(config_path: Path, league: str, tune: bool = False) -> None
     )
 
     # ── Persist artifacts ─────────────────────────────────────────────────────
-    joblib.dump(model, models_dir / f"{league}_tourney_model.pkl")
+    joblib.dump(final_model, models_dir / f"{tag}_tourney_model.pkl")
+
+    # Save each fold model for the ensemble.
+    for i, fm in enumerate(fold_models):
+        joblib.dump(fm, models_dir / f"{tag}_tourney_fold_{i}.pkl")
+    print(f"[{tag}] Saved {len(fold_models)} fold models for ensemble.")
+
+    # Save metadata.
     pd.Series(available_feats, name="feature").to_csv(
-        models_dir / f"{league}_tourney_features.csv", index=False
+        models_dir / f"{tag}_tourney_features.csv", index=False
     )
     pd.DataFrame(
         [{"season": s, "brier": b} for s, b in zip(sorted(cv_test_seasons), cv_briers)]
-    ).to_csv(models_dir / f"{league}_tourney_cv.csv", index=False)
-    print(f"[{league}] Model saved → {models_dir / f'{league}_tourney_model.pkl'}")
+    ).to_csv(models_dir / f"{tag}_tourney_cv.csv", index=False)
+    # Record spline and margin_clip alongside fold count for predict_submission.
+    pd.DataFrame([{
+        "tag": tag,
+        "n_folds": len(fold_models),
+        "margin_clip": margin_clip,
+        "features": ",".join(available_feats),
+    }]).to_csv(models_dir / f"{tag}_tourney_meta.csv", index=False)
+    print(f"[{tag}] Model saved → {models_dir / f'{tag}_tourney_model.pkl'}")
+
+
+# ── Per-league training ───────────────────────────────────────────────────────
+
+def train_for_league(config_path: Path, league: str, tune: bool = False) -> None:
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    data_dir = Path(cfg["paths"]["data_dir"])
+    models_dir = Path(cfg["paths"]["models_dir"])
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    all_matchups = _load_matchups_for_league(league, cfg, models_dir, data_dir)
+
+    config_feats = cfg.get("tournament_model", {}).get("features", MATCHUP_DIFF_FEATURES)
+    # men_women feature only makes sense for the combined model; skip for per-league.
+    config_feats = [f for f in config_feats if f != "men_women"]
+    available_feats = [f for f in config_feats if f in all_matchups.columns]
+    missing_feats = sorted(set(config_feats) - set(available_feats))
+    if missing_feats:
+        print(f"[{league}] Skipping unavailable features: {missing_feats}")
+
+    all_matchups = _prepare_matchups(all_matchups, available_feats, league)
+    _train_and_save(league, all_matchups, available_feats, cfg, models_dir, tune)
+
+
+# ── Combined M+W training ─────────────────────────────────────────────────────
+
+def train_combined(config_path: Path, tune: bool = False) -> None:
+    """Train a single model on Men's + Women's data with a men_women gender flag.
+
+    This doubles training data and gives the spline calibrator more OOF points,
+    which is one of the key techniques from the 2025 winning solution.
+    """
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    data_dir = Path(cfg["paths"]["data_dir"])
+    models_dir = Path(cfg["paths"]["models_dir"])
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    m_matchups = _load_matchups_for_league("M", cfg, models_dir, data_dir)
+    w_matchups = _load_matchups_for_league("W", cfg, models_dir, data_dir)
+
+    m_matchups["men_women"] = 1
+    w_matchups["men_women"] = 0
+
+    all_matchups = pd.concat([m_matchups, w_matchups], ignore_index=True)
+    print(
+        f"[combined] Men's: {len(m_matchups)} rows, Women's: {len(w_matchups)} rows, "
+        f"Total: {len(all_matchups)} rows."
+    )
+
+    config_feats = cfg.get("tournament_model", {}).get("features", MATCHUP_DIFF_FEATURES)
+    available_feats = [f for f in config_feats if f in all_matchups.columns]
+    missing_feats = sorted(set(config_feats) - set(available_feats))
+    if missing_feats:
+        print(f"[combined] Skipping unavailable features: {missing_feats}")
+
+    all_matchups = _prepare_matchups(all_matchups, available_feats, "combined")
+    _train_and_save("combined", all_matchups, available_feats, cfg, models_dir, tune)
 
 
 def main() -> None:
@@ -292,14 +381,24 @@ def main() -> None:
         description="Train margin regression tournament model for NCAA MMLM."
     )
     parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--league", type=str, choices=["M", "W", "both"], default="both")
+    parser.add_argument(
+        "--league",
+        type=str,
+        choices=["M", "W", "both", "combined"],
+        default="combined",
+        help="'combined' trains one M+W model (recommended). 'both' trains separate models.",
+    )
     parser.add_argument("--tune", action="store_true",
                         help="Run Optuna hyperparameter sweep.")
     args = parser.parse_args()
     config_path = Path(args.config)
-    leagues = ["M", "W"] if args.league == "both" else [args.league]
-    for league in leagues:
-        train_for_league(config_path, league, tune=args.tune)
+
+    if args.league == "combined":
+        train_combined(config_path, tune=args.tune)
+    else:
+        leagues = ["M", "W"] if args.league == "both" else [args.league]
+        for league in leagues:
+            train_for_league(config_path, league, tune=args.tune)
 
 
 if __name__ == "__main__":

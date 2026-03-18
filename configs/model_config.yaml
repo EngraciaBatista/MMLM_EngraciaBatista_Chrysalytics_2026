@@ -18,6 +18,39 @@ seasons:
   # Seasons held out exclusively for isotonic calibration (not used in CV or training).
   calib_seasons: [2024, 2025]
 
+# ── Elo rating ────────────────────────────────────────────────────────────────
+elo:
+  base_rating: 1500.0
+  k_factor: 20.0
+  mov_scale: 400.0
+  regression_factor: 0.75
+  home_advantage: 0.0
+
+# ── Power rating model (auxiliary — regular season margin regression) ─────────
+power_model:
+  margin_cap: 20
+  features:
+    - off_eff_diff
+    - def_eff_diff
+    - pace_diff
+    - win_pct_diff
+    - avg_margin_diff
+    - elo_diff
+    - rank_diff
+    - SeedNum_diff
+  lightgbm_params:
+    n_estimators: 200
+    learning_rate: 0.05
+    max_depth: 4
+    num_leaves: 15
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_samples: 20
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    random_state: 2026
+    verbose: -1
+
 # ── Strength rating (Step 5) ──────────────────────────────────────────────────
 # Bradley-Terry logistic regression; no tunable params beyond regularisation.
 strength_rating:
@@ -45,7 +78,11 @@ tournament_model:
     - win_pct_diff
     - avg_margin_diff
     - pace_diff
+    - avg_dr_diff            # Defensive rebounds per game (winner used this)
+    - avg_blk_diff           # Blocks per game (winner used this)
+    - avg_pf_diff            # Personal fouls per game (winner used this)
     - strength_seed_interaction
+    - men_women              # Combined model: 1=Men's, 0=Women's
 
   # LightGBM REGRESSOR params (predicts point differential, not win probability).
   # Lower complexity than a classifier because the regression target is smoother.

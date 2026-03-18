@@ -110,40 +110,106 @@ def main() -> None:
                 "MTeams.csv or WTeams.csv."
             )
 
-    # ── Load models and team features for each league ─────────────────────────
-    league_data: dict[str, dict] = {}
+    # ── Detect model mode: combined or per-league ─────────────────────────────
+    combined_model_path = models_dir / "combined_tourney_model.pkl"
+    use_combined = combined_model_path.exists()
+
+    if use_combined:
+        print("Using combined Men's+Women's model (recommended).")
+        combined_model: CalibratedTournamentModel = joblib.load(combined_model_path)
+        combined_feat_names: list[str] = combined_model.features
+        # Load fold models for ensemble averaging.
+        combined_fold_models = []
+        i = 0
+        while (models_dir / f"combined_tourney_fold_{i}.pkl").exists():
+            combined_fold_models.append(joblib.load(models_dir / f"combined_tourney_fold_{i}.pkl"))
+            i += 1
+        print(f"  Loaded {len(combined_fold_models)} fold models for ensemble.")
+    else:
+        # Fallback: load per-league models.
+        league_data: dict[str, dict] = {}
+        for league in ("M", "W"):
+            feat_path = models_dir / f"{league}_team_features.csv"
+            model_path = models_dir / f"{league}_tourney_model.pkl"
+            if not feat_path.exists() or not model_path.exists():
+                print(f"[Warning] Model/features missing for league {league} — skipping.")
+                continue
+            m = joblib.load(model_path)
+            fold_models = []
+            j = 0
+            while (models_dir / f"{league}_tourney_fold_{j}.pkl").exists():
+                fold_models.append(joblib.load(models_dir / f"{league}_tourney_fold_{j}.pkl"))
+                j += 1
+            league_data[league] = {
+                "team_features": pd.read_csv(feat_path),
+                "model": m,
+                "features": m.features,
+                "fold_models": fold_models,
+            }
+
+    # ── Load team feature tables ───────────────────────────────────────────────
+    league_features: dict[str, pd.DataFrame] = {}
     for league in ("M", "W"):
-        feat_path = models_dir / f"{league}_team_features.csv"
-        model_path = models_dir / f"{league}_tourney_model.pkl"
-
-        if not feat_path.exists():
-            print(f"[Warning] Team features not found: {feat_path} — skipping league {league}.")
-            continue
-        if not model_path.exists():
-            print(f"[Warning] Model not found: {model_path} — skipping league {league}.")
-            continue
-
-        team_features = pd.read_csv(feat_path)
-        model: CalibratedTournamentModel = joblib.load(model_path)
-
-        league_data[league] = {
-            "team_features": team_features,
-            "model": model,
-            "features": model.features,
-        }
+        fp = models_dir / f"{league}_team_features.csv"
+        if fp.exists():
+            league_features[league] = pd.read_csv(fp)
 
     # ── Generate predictions ──────────────────────────────────────────────────
     id_to_pred: dict[str, float] = {}
 
+    def _predict_batch(
+        records: list[dict],
+        feat_names: list[str],
+        main_model,
+        fold_models: list,
+        men_women_val: int | None = None,
+    ) -> np.ndarray:
+        """Run ensemble prediction: average fold models + final model."""
+        df_pairs = pd.DataFrame.from_records(records)
+        # Inject gender flag for combined model.
+        if men_women_val is not None and "men_women" in feat_names:
+            df_pairs["men_women"] = float(men_women_val)
+        # Fill any NaN features with 0 (should rarely occur at prediction time).
+        for col in feat_names:
+            if col not in df_pairs.columns:
+                df_pairs[col] = 0.0
+            else:
+                df_pairs[col] = df_pairs[col].fillna(0.0)
+        X = df_pairs[feat_names].values.astype(float)
+        # Ensemble: average spline-calibrated probabilities from all fold models + final.
+        prob_arrays = []
+        margin_clip = main_model.margin_clip
+        spline = main_model.spline
+        for fm in fold_models:
+            margins = fm.predict(X)
+            probs = np.clip(spline(np.clip(margins, -margin_clip, margin_clip)), 0.0, 1.0)
+            prob_arrays.append(probs)
+        # Add final model predictions.
+        prob_arrays.append(main_model.predict_proba(X))
+        preds = np.mean(prob_arrays, axis=0) if prob_arrays else main_model.predict_proba(X)
+        # Confidence boost: predictions below 0.85 are nudged upward (winner's technique).
+        preds = np.where(preds < 0.85, preds * 1.10, preds)
+        # Tighter clip: [0.01, 0.99] instead of [0.05, 0.95] to allow near-certain matchups.
+        preds = np.clip(preds, 0.01, 0.99)
+        return preds
+
     for league in ("M", "W"):
-        if league not in league_data:
+        if league not in league_features:
             continue
+        if use_combined:
+            main_model = combined_model
+            feat_names = combined_feat_names
+            fold_mdls = combined_fold_models
+            men_women_val = 1 if league == "M" else 0
+        else:
+            if league not in league_data:
+                continue
+            main_model = league_data[league]["model"]
+            feat_names = league_data[league]["features"]
+            fold_mdls = league_data[league]["fold_models"]
+            men_women_val = None
 
-        data = league_data[league]
-        team_features: pd.DataFrame = data["team_features"]
-        model: CalibratedTournamentModel = data["model"]
-        feat_names: list[str] = data["features"]
-
+        team_features = league_features[league]
         sub = template[template["_League"] == league]
         if sub.empty:
             continue
@@ -151,16 +217,13 @@ def main() -> None:
         available_seasons = sorted(team_features["Season"].dropna().unique().tolist())
         if not available_seasons:
             for _, r in sub.iterrows():
-                id_to_reason[str(r["ID"])] = (
-                    f"No team features at all for league {league}."
-                )
+                id_to_reason[str(r["ID"])] = f"No team features at all for league {league}."
             continue
 
         for season in sub["_Season"].unique():
             season_feats = team_features[team_features["Season"] == season]
             season_rows = sub[sub["_Season"] == season]
 
-            # Proxy: if season has no features (e.g. 2026), use the latest available.
             if season_feats.empty:
                 proxy = max(available_seasons)
                 season_feats = team_features[team_features["Season"] == proxy]
@@ -170,10 +233,7 @@ def main() -> None:
                             f"No features for {league}/{season} and no proxy available."
                         )
                     continue
-                print(
-                    f"  [Warning] No features for {league}/{season}; "
-                    f"using season {proxy} as proxy."
-                )
+                print(f"  [Warning] No features for {league}/{season}; using season {proxy} as proxy.")
 
             records = []
             indices = []
@@ -186,8 +246,7 @@ def main() -> None:
                     base_feature_names=MATCHUP_BASE_FEATURES,
                 )
                 if rec is None:
-                    row_id = str(r["ID"])
-                    id_to_reason[row_id] = (
+                    id_to_reason[str(r["ID"])] = (
                         f"TeamLow={int(r['_TeamLow'])} or TeamHigh={int(r['_TeamHigh'])} "
                         f"missing from {league} team features for season {season}."
                     )
@@ -198,16 +257,7 @@ def main() -> None:
             if not records:
                 continue
 
-            df_pairs = pd.DataFrame.from_records(records)
-            missing_cols = [f for f in feat_names if f not in df_pairs.columns]
-            if missing_cols:
-                raise ValueError(
-                    f"[{league}/{season}] Missing expected feature columns: {missing_cols}"
-                )
-
-            X = df_pairs[feat_names].values.astype(float)
-            preds = model.predict_proba(X)
-            preds = np.clip(preds, 0.05, 0.95)
+            preds = _predict_batch(records, feat_names, main_model, fold_mdls, men_women_val)
 
             for k, idx in enumerate(indices):
                 row_id = str(template.at[idx, "ID"])

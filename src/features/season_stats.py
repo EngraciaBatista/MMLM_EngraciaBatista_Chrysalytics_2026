@@ -48,6 +48,12 @@ def _build_game_level_view(detailed_results: pd.DataFrame) -> pd.DataFrame:
         "LTO": "OppTO",
         "WOR": "OR",
         "LOR": "OppOR",
+        "WDR": "DR",
+        "LDR": "OppDR",
+        "WBlk": "Blk",
+        "LBlk": "OppBlk",
+        "WPF": "PF",
+        "LPF": "OppPF",
     }
     l_cols = {
         "Season": "Season",
@@ -65,12 +71,22 @@ def _build_game_level_view(detailed_results: pd.DataFrame) -> pd.DataFrame:
         "WTO": "OppTO",
         "LOR": "OR",
         "WOR": "OppOR",
+        "LDR": "DR",
+        "WDR": "OppDR",
+        "LBlk": "Blk",
+        "WBlk": "OppBlk",
+        "LPF": "PF",
+        "WPF": "OppPF",
     }
 
     # Gracefully handle missing NumOT column (older data formats).
     src = detailed_results.copy()
     if "NumOT" not in src.columns:
         src["NumOT"] = 0
+    # Gracefully handle missing box-score columns (DR, Blk, PF).
+    for col in ["WDR", "LDR", "WBlk", "LBlk", "WPF", "LPF"]:
+        if col not in src.columns:
+            src[col] = np.nan
 
     w_games = src[list(w_cols.keys())].rename(columns=w_cols)
     l_games = src[list(l_cols.keys())].rename(columns=l_cols)
@@ -80,8 +96,10 @@ def _build_game_level_view(detailed_results: pd.DataFrame) -> pd.DataFrame:
     # Divide all counting stats by (40 + 5*NumOT)/40 so OT games are comparable
     # to regulation games on a per-40-minute basis.
     ot_factor = (40.0 + 5.0 * games["NumOT"]) / 40.0
-    for col in ["Score", "OppScore", "FGA", "OppFGA", "FTA", "OppFTA", "TO", "OppTO", "OR", "OppOR"]:
-        games[col] = games[col] / ot_factor
+    for col in ["Score", "OppScore", "FGA", "OppFGA", "FTA", "OppFTA", "TO", "OppTO", "OR", "OppOR",
+                "DR", "OppDR", "Blk", "OppBlk", "PF", "OppPF"]:
+        if col in games.columns:
+            games[col] = games[col] / ot_factor
 
     games["is_win"] = (games["Score"] > games["OppScore"]).astype(int)
     games["margin"] = games["Score"] - games["OppScore"]
@@ -117,7 +135,7 @@ def compute_team_season_stats(detailed_results: pd.DataFrame) -> pd.DataFrame:
     # Guard against zero / negative possessions (data quality edge case).
     games["possessions"] = games["possessions"].clip(lower=1.0)
 
-    grouped = games.groupby(["Season", "TeamID"], as_index=False).agg(
+    agg_dict = dict(
         games_played=("TeamID", "size"),
         wins=("is_win", "sum"),
         points_scored=("Score", "sum"),
@@ -125,6 +143,12 @@ def compute_team_season_stats(detailed_results: pd.DataFrame) -> pd.DataFrame:
         total_margin=("margin", "sum"),
         total_possessions=("possessions", "sum"),
     )
+    # Include box-score totals only when the columns are present and non-null.
+    for raw_col, agg_name in [("DR", "total_dr"), ("Blk", "total_blk"), ("PF", "total_pf")]:
+        if raw_col in games.columns and games[raw_col].notna().any():
+            agg_dict[agg_name] = (raw_col, "sum")
+
+    grouped = games.groupby(["Season", "TeamID"], as_index=False).agg(**agg_dict)
 
     grouped["win_pct"] = grouped["wins"] / grouped["games_played"]
     grouped["avg_margin"] = grouped["total_margin"] / grouped["games_played"]
@@ -134,12 +158,18 @@ def compute_team_season_stats(detailed_results: pd.DataFrame) -> pd.DataFrame:
     grouped["net_rating"] = grouped["off_eff"] - grouped["def_eff"]
     grouped["pace"] = grouped["total_possessions"] / grouped["games_played"]
 
+    # Per-game box score averages (only when data was available).
+    extra_cols = []
+    for total_col, avg_col in [("total_dr", "avg_dr"), ("total_blk", "avg_blk"), ("total_pf", "avg_pf")]:
+        if total_col in grouped.columns:
+            grouped[avg_col] = grouped[total_col] / grouped["games_played"]
+            extra_cols.append(avg_col)
+
     # Replace any infinities or NaNs produced by sparse data.
     grouped = grouped.replace([np.inf, -np.inf], np.nan)
 
-    return grouped[
-        ["Season", "TeamID", "off_eff", "def_eff", "net_rating", "win_pct", "avg_margin", "pace"]
-    ]
+    base_cols = ["Season", "TeamID", "off_eff", "def_eff", "net_rating", "win_pct", "avg_margin", "pace"]
+    return grouped[base_cols + extra_cols]
 
 
 def compute_opponent_stats(detailed_results: pd.DataFrame) -> pd.DataFrame:
