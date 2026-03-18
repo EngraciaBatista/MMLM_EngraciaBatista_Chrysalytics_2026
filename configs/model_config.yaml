@@ -1,0 +1,70 @@
+# NCAA March Madness Prediction — Model Configuration
+# Rebuilt per checklist (targeting ~0.103 Brier score).
+seed: 2026
+
+paths:
+  data_dir: "data"
+  outputs_dir: "outputs"
+  models_dir: "outputs/models"
+  submissions_dir: "outputs/submissions"
+  submission_template: "SampleSubmissionStage2.csv"
+  final_submission_file: "FinalSubmissionStage.csv"
+
+seasons:
+  min_season: 2003
+  max_season: 2026
+  # Seasons used as held-out folds in CV (train on all prior seasons, test on listed).
+  cv_test_seasons: [2018, 2019, 2021, 2022, 2023]
+  # Seasons held out exclusively for isotonic calibration (not used in CV or training).
+  calib_seasons: [2024, 2025]
+
+# ── Strength rating (Step 5) ──────────────────────────────────────────────────
+# Bradley-Terry logistic regression; no tunable params beyond regularisation.
+strength_rating:
+  regularisation_C: 1.0        # sklearn LogisticRegression C parameter
+  max_iter: 2000
+  random_state: 2026
+
+# ── Tournament matchup model (Steps 11-12) ────────────────────────────────────
+tournament_model:
+  # Feature differences used as model inputs.
+  # margin_quality_diff is the single most important new feature (winner's key signal).
+  features:
+    - margin_quality_diff      # OLS/Massey margin quality (winner's key feature)
+    - strength_rating_diff     # Bradley-Terry win/loss quality
+    - seed_strength_diff
+    - elo_rating_diff          # Late-season Elo: captures momentum
+    - adj_off_eff_diff         # SOS-adjusted offensive efficiency
+    - adj_def_eff_diff         # SOS-adjusted defensive efficiency
+    - adj_net_rating_diff
+    - off_eff_diff
+    - def_eff_diff
+    - net_rating_diff
+    - opp_avg_score_diff       # How many points opponents score against this team
+    - opp_avg_fga_diff         # How many shots opponents attempt against this team
+    - win_pct_diff
+    - avg_margin_diff
+    - pace_diff
+    - strength_seed_interaction
+
+  # LightGBM REGRESSOR params (predicts point differential, not win probability).
+  # Lower complexity than a classifier because the regression target is smoother.
+  lgbm_params:
+    n_estimators: 300
+    learning_rate: 0.05
+    max_depth: 4
+    num_leaves: 15
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_samples: 20
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    random_state: 2026
+    verbose: -1
+
+  # Margin clip (±N points) before applying the spline calibrator.
+  # Games beyond ±25 pts are rare blowouts where the win is certain anyway.
+  margin_clip: 25.0
+
+  # Number of Optuna trials when --tune flag is passed to train_tournament_model.py.
+  optuna_trials: 50
