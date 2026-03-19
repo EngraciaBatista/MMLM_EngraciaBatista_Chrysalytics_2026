@@ -14,7 +14,7 @@ seasons:
   min_season: 2003
   max_season: 2026
   # Seasons used as held-out folds in CV (train on all prior seasons, test on listed).
-  cv_test_seasons: [2018, 2019, 2021, 2022, 2023]
+  cv_test_seasons: [2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023]
   # Seasons held out exclusively for isotonic calibration (not used in CV or training).
   calib_seasons: [2024, 2025]
 
@@ -104,4 +104,4 @@ tournament_model:
   margin_clip: 25.0
 
   # Number of Optuna trials when --tune flag is passed to train_tournament_model.py.
-  optuna_trials: 50
+  optuna_trials: 100
